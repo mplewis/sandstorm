@@ -1114,6 +1114,153 @@ print_success() {
   fi
 }
 
+sandcats_provide_help() {
+  echo "Sandcats.io is a free dynamic DNS service run by the Sandstorm development team."
+  echo ""
+  echo "You can:"
+  echo ""
+  echo "* Read more about it at:"
+  echo "  https://github.com/sandstorm-io/sandstorm/wiki/Sandcats-dynamic-DNS"
+  echo ""
+  echo "* Recover access to a domain you once registered with sandcats"
+  echo ""
+  echo "* Just press enter to go to the previous question."
+  DESIRED_SANDCATS_NAME=$(prompt "What Sandcats domain do you want to recover?" "none")
+
+  # If the user wants none of our help, then go back to registration.
+  if [ "none" = "$DESIRED_SANDCATS_NAME" ] ; then
+    sandcats_register_name
+    return
+  fi
+
+  echo "OK. We will send a recovery token to the email address on file. Type no to abort."
+  OK_TO_CONTINUE=$(prompt "OK to continue?" "yes")
+  if [ "no" = "$OK_TO_CONTINUE" ] ; then
+    sandcats_register_name
+    return
+  fi
+
+  # First, we attempt to send the user a domain recovery token.
+  local LOG_PATH="var/sandcats/sendrecoverytoken-log"
+  HTTP_STATUS=$(
+    curl \
+      --silent \
+      --max-time 20 \
+      $SANDCATS_CURL_PARAMS \
+      -X POST \
+      --data-urlencode "rawHostname=$DESIRED_SANDCATS_NAME" \
+      --output "$LOG_PATH" \
+      -w '%{http_code}' \
+      -H 'X-Sand: cats' \
+      -H "Accept: text/plain" \
+      "${SANDCATS_API_BASE}/sendrecoverytoken")
+  chmod 0640 "$LOG_PATH"
+
+  if [ "200" != "$HTTP_STATUS" ] ; then
+    # Print out the error, and then send the user back to the top of
+    # help.
+    error "$(cat $LOG_PATH)"
+    sandcats_provide_help
+    return
+  fi
+
+  # Show the server's output, which presumably is some happy
+  # message.
+  cat "$LOG_PATH"
+  # Make sure that is on a line of its own.
+  echo ''
+  TOKEN=$(prompt "Please enter the token that we sent to you by email." '')
+
+  # If the token is empty, then they just hit enter; take them to the start of help.
+  if [ -z "$TOKEN" ] ; then
+    error "Empty tokens are not valid."
+    sandcats_provide_help
+    return
+  fi
+
+  # Let's submit that token to the server's "recover" endpoint.
+  #
+  # This action registers the new key as the authoritative key for
+  # this hostname. It also sends an email to the user telling them
+  # that we changed the key they have on file.
+  echo -n "$TOKEN" | hexdump -C
+  LOG_PATH="var/sandcats/recover-log"
+  HTTP_STATUS=$(
+    curl \
+      -v \
+      --max-time 20 \
+      $SANDCATS_CURL_PARAMS \
+      -X POST \
+      --data-urlencode "rawHostname=$DESIRED_SANDCATS_NAME" \
+      --data-urlencode "recoveryToken=$TOKEN" \
+      --output "$LOG_PATH" \
+      -w '%{http_code}' \
+      -H 'X-Sand: cats' \
+      -H "Accept: text/plain" \
+      --cert var/sandcats/id_rsa.private_combined \
+      "${SANDCATS_API_BASE}/recover")
+  chmod 0640 "$LOG_PATH"
+
+  if [ "200" != "$HTTP_STATUS" ] ; then
+    error "$(cat $LOG_PATH)"
+    sandcats_provide_help
+    # We could have a little loop in case the user submitted a typo'd
+    # token, and let them retry, but for simplicity, we'll go back to
+    # the top of this help function.
+    return
+  fi
+
+  # Show the server's output, which presumably is some happy
+  # message.
+  cat "$LOG_PATH"
+  # Make sure that is on a line of its own.
+  echo ''
+
+  # Print something indicating we're working
+  echo -n '...'
+
+  # Now we can do a call to /update, which we will do silently on the
+  # user's behalf. This uses the new key we registered (via /recover)
+  # and sets the IP address for this host in the sandcats.io DNS
+  # service.
+  LOG_PATH="var/sandcats/update-log"
+  HTTP_STATUS=$(
+    curl \
+      --silent \
+      --max-time 20 \
+      $SANDCATS_CURL_PARAMS \
+      -X POST \
+      --data-urlencode "rawHostname=$DESIRED_SANDCATS_NAME" \
+      --output "$LOG_PATH" \
+      -w '%{http_code}' \
+      -H 'X-Sand: cats' \
+      -H "Accept: text/plain" \
+      --cert var/sandcats/id_rsa.private_combined \
+      "${SANDCATS_API_BASE}/update")
+  chmod 0640 "$LOG_PATH"
+
+  # Move to front of line, so future echo-ing will clear the line.
+  echo -ne '\r'
+
+  if [ "200" != "$HTTP_STATUS" ] ; then
+    error "$(cat $LOG_PATH)"
+    sandcats_provide_help
+    # We could have a little loop in case the user submitted a typo'd
+    # token, and let them retry, but for simplicity, we'll go back to
+    # the top of this help function.
+    return
+  fi
+
+  # Show the server's happy message.
+  cat "$LOG_PATH"
+  # Make sure that is on a line of its own.
+  echo ''
+
+  SANDCATS_SUCCESSFUL="yes"
+  echo "Congratulations! You're all configured to use ${DESIRED_SANDCATS_NAME}.${SANDCATS_BASE_DOMAIN}."
+  echo "Your credentials to use it are in $(readlink -f var/sandcats); consider making a backup."
+}
+
 sandcats_register_name() {
   # We allow environment variables to override some details of the
   # Sandcats service, so that during development, we can test against
@@ -1122,7 +1269,7 @@ sandcats_register_name() {
   SANDCATS_CURL_PARAMS="${OVERRIDE_SANDCATS_CURL_PARAMS:-}"
 
   echo "Choose your desired Sandcats subdomain (alphanumeric, max 20 characters)."
-  echo "Type the word none to skip this step."
+  echo "Type the word none to skip this step, or help for help."
   DESIRED_SANDCATS_NAME=$(prompt "What *.${SANDCATS_BASE_DOMAIN} subdomain would you like?" '')
 
   # If they just press enter, insist that they type either the word
@@ -1134,6 +1281,12 @@ sandcats_register_name() {
 
   # If the user really wants none of our sandcats help, then bail out.
   if [ "none" = "$DESIRED_SANDCATS_NAME" ] ; then
+    return
+  fi
+
+  # If the wants help, offer help.
+  if [ "help" = "$DESIRED_SANDCATS_NAME" ] ; then
+    sandcats_provide_help
     return
   fi
 
